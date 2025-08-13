@@ -617,12 +617,13 @@ class SilenceProcessor:
             logger.error(f"❌ Ses analizi hatası: {str(e)}")
             raise
     
-    def process_special_folder(self, special_folder_code):
+    def process_special_folder(self, special_folder_code, split_audio=False):
         """
-        SpecialFolderCode'a göre ses dosyasını analiz eder
+        SpecialFolderCode'a göre ses dosyasını analiz eder ve isteğe bağlı parçalar
         
         Args:
             special_folder_code (str): Klasör kodu (örn: test_20250813_084422)
+            split_audio (bool): True ise parçalara ayır, False ise sadece analiz
             
         Returns:
             dict: Analiz sonucu
@@ -670,7 +671,15 @@ class SilenceProcessor:
                 special_folder_code
             )
             
-            # 11. Sonucu döndür
+            # 12. İsteğe bağlı parçalama işlemi
+            split_result = None
+            if split_audio:
+                logger.info("🔪 Parçalama işlemi başlatılıyor...")
+                from audio_splitter import AudioSplitter
+                splitter = AudioSplitter(self.volume_path)
+                split_result = splitter.split_audio_from_parts_json(special_folder_code)
+            
+            # 13. Sonucu döndür
             result = {
                 "success": True,
                 "special_folder_code": special_folder_code,
@@ -684,7 +693,9 @@ class SilenceProcessor:
                 "silence_json_created": True,
                 "split_plan": split_plan,
                 "parts_json_created": True,
-                "message": f"Ses dosyası, meta bilgileri, sessizlik analizi, JSON dosyaları ve Silence7 parçalama planı tamamlandı: {islenmemis_filename}"
+                "split_audio": split_audio,
+                "split_result": split_result,
+                "message": f"Ses dosyası, meta bilgileri, sessizlik analizi, JSON dosyaları{', parçalama' if split_audio else ''} ve Silence7 planı tamamlandı: {islenmemis_filename}"
             }
             
             logger.info(f"✅ İşlem tamamlandı: {islenmemis_filename} - {audio_info['duration_seconds']}s")
@@ -719,6 +730,7 @@ def handler(job):
             return {"error": "SpecialFolderCode parametresi gerekli"}
         
         special_folder_code = job_input["SpecialFolderCode"]
+        split_audio = job_input.get("split_audio", False)  # Yeni parametre
         
         logger.info(f"🎯 Handler başlatıldı: {special_folder_code}")
         
@@ -726,7 +738,7 @@ def handler(job):
         processor = SilenceProcessor()
         
         # Ses dosyasını analiz et
-        result = processor.process_special_folder(special_folder_code)
+        result = processor.process_special_folder(special_folder_code, split_audio)
         
         if result["success"]:
             # Başarılı sonucu döndür
