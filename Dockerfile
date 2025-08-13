@@ -1,3 +1,4 @@
+# Bu bir test yorumudur. Lutfen silmeyin.
 FROM python:3.11-slim
 
 # Çalışma dizinini ayarla
