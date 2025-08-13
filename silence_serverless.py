@@ -319,6 +319,252 @@ class SilenceProcessor:
             logger.error(f"❌ Meta bilgi çıkarma hatası: {str(e)}")
             raise
     
+    def _create_silence_json(self, silence_segments, special_folder_code):
+        """
+        silence.json dosyasını oluşturur (sessizlik noktaları)
+        
+        Args:
+            silence_segments (list): Sessizlik segmentleri
+            special_folder_code (str): Klasör kodu
+        """
+        try:
+            silence_json_path = os.path.join(self.volume_path, "uploads", special_folder_code, "silence.json")
+            
+            silence_data = {
+                "silences": silence_segments,
+                "total_segments": len(silence_segments),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                "analysis_version": "1.0"
+            }
+            
+            with open(silence_json_path, 'w', encoding='utf-8') as f:
+                json.dump(silence_data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"✅ silence.json oluşturuldu: {len(silence_segments)} sessizlik segmenti")
+            return silence_data
+            
+        except Exception as e:
+            logger.error(f"❌ silence.json oluşturma hatası: {str(e)}")
+            raise
+
+    def _calculate_intelligent_split_plan(self, total_duration_minutes, silence_segments, special_folder_code):
+        """
+        Akıllı parçalama planı oluşturur ve parts.json kaydeder (silence7/8 stratejisi)
+        
+        Args:
+            total_duration_minutes (float): Toplam ses süresi (dakika)
+            silence_segments (list): Sessizlik segmentleri
+            special_folder_code (str): Klasör kodu
+            
+        Returns:
+            dict: Parçalama planı
+        """
+        try:
+            logger.info(f"🤖 Akıllı parçalama planı hesaplanıyor: {total_duration_minutes:.2f} dakika")
+            
+            # Hedef parça süresi: 15 dakika
+            target_segment_minutes = 15
+            
+            # Parça sayısını hesapla
+            if total_duration_minutes <= 20:
+                # 20 dakika ve altı: bölme
+                num_pieces = 1
+                logger.info(f"📝 {total_duration_minutes:.1f} dakika ≤ 20dk → Bölme gerek yok")
+            else:
+                # 20 dakikadan fazla: 15'er dakikalık parçalara böl
+                num_pieces = max(2, round(total_duration_minutes / target_segment_minutes))
+                logger.info(f"📝 {total_duration_minutes:.1f} dakika > 20dk → {num_pieces} parçaya böl")
+            
+            if num_pieces == 1:
+                # Tek parça - parts.json yine de oluştur
+                single_piece_plan = {
+                    "split_needed": False,
+                    "total_duration_minutes": total_duration_minutes,
+                    "target_segment_minutes": target_segment_minutes,
+                    "recommended_pieces": 1,
+                    "pieces": [
+                        {
+                            "piece_index": 1,
+                            "start_ms": 0,
+                            "end_ms": int(total_duration_minutes * 60 * 1000),
+                            "start_formatted": "00:00:00.000",
+                            "end_formatted": self._seconds_to_timestamp(total_duration_minutes * 60),
+                            "duration_ms": int(total_duration_minutes * 60 * 1000),
+                            "duration_minutes": total_duration_minutes,
+                            "trim_leading_ms": 0
+                        }
+                    ],
+                    "split_points": [],
+                    "message": f"Ses dosyası {total_duration_minutes:.1f} dakika - bölme gerek yok"
+                }
+                
+                # parts.json kaydet
+                self._create_parts_json(single_piece_plan, special_folder_code)
+                return single_piece_plan
+            
+            # Hedef bölme noktalarını hesapla (dakika cinsinden)
+            target_minutes = []
+            for i in range(1, num_pieces):
+                target = (total_duration_minutes / num_pieces) * i
+                target_minutes.append(target)
+            
+            logger.info(f"🎯 Hedef bölme noktaları: {[f'{t:.1f}dk' for t in target_minutes]}")
+            
+            # Her hedef noktaya en yakın sessizliği bul
+            selected_silences = []
+            
+            for target_min in target_minutes:
+                target_seconds = target_min * 60
+                
+                # En yakın sessizliği bul
+                best_silence = None
+                best_distance = float('inf')
+                
+                for silence in silence_segments:
+                    # Sessizliğin ortası
+                    silence_middle_ms = (silence['start_ms'] + silence['end_ms']) / 2
+                    silence_middle_seconds = silence_middle_ms / 1000
+                    
+                    distance = abs(silence_middle_seconds - target_seconds)
+                    
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_silence = silence
+                
+                if best_silence:
+                    selected_silences.append([best_silence['start_ms'], best_silence['end_ms']])
+                    logger.info(f"✅ Hedef {target_min:.1f}dk → Sessizlik #{best_silence['index']}")
+                else:
+                    logger.warning(f"⚠️  Hedef {target_min:.1f}dk için uygun sessizlik bulunamadı")
+            
+            # Silence7/8 stratejisi ile parçaları oluştur
+            pieces = self._make_piece_plan_silence7_strategy(selected_silences, int(total_duration_minutes * 60 * 1000))
+            
+            logger.info(f"🎉 Silence7 stratejisi ile {len(pieces)} parça oluşturuldu")
+            
+            split_plan = {
+                "split_needed": True,
+                "total_duration_minutes": total_duration_minutes,
+                "target_segment_minutes": target_segment_minutes,
+                "recommended_pieces": num_pieces,
+                "selected_silences": selected_silences,
+                "pieces": pieces,
+                "strategy": "silence7_overlapping_segments",
+                "message": f"Ses dosyası {num_pieces} parçaya bölünecek (Silence7 stratejisi, {target_segment_minutes}dk hedefi)"
+            }
+            
+            # parts.json kaydet
+            self._create_parts_json(split_plan, special_folder_code)
+            return split_plan
+            
+        except Exception as e:
+            logger.error(f"❌ Parçalama planı hatası: {str(e)}")
+            raise
+    
+    def _make_piece_plan_silence7_strategy(self, silences_ms, total_ms):
+        """
+        Silence7/8 stratejisi ile parça planı oluşturur
+        
+        Args:
+            silences_ms (list): Seçilen sessizlik segmentleri [[start_ms, end_ms], ...]
+            total_ms (int): Toplam ses süresi (ms)
+            
+        Returns:
+            list: Parça planı
+        """
+        pieces = []
+        
+        if not silences_ms:
+            pieces.append({
+                "piece_index": 1,
+                "start_ms": 0,
+                "end_ms": total_ms,
+                "start_formatted": self._ms_to_timestamp(0),
+                "end_formatted": self._ms_to_timestamp(total_ms),
+                "duration_ms": total_ms,
+                "duration_minutes": round(total_ms / 60000, 2),
+                "trim_leading_ms": 0
+            })
+            return pieces
+        
+        # P1 = [0, b1] (ilk sessizliğin bitişine kadar)
+        a1, b1 = silences_ms[0]
+        pieces.append({
+            "piece_index": 1,
+            "start_ms": 0,
+            "end_ms": b1,
+            "start_formatted": self._ms_to_timestamp(0),
+            "end_formatted": self._ms_to_timestamp(b1),
+            "duration_ms": b1,
+            "duration_minutes": round(b1 / 60000, 2),
+            "trim_leading_ms": 0
+        })
+        
+        # Pi = [a_{i-1}, b_i] (i>=2) (önceki sessizliğin başından, şu anki sessizliğin bitişine)
+        for i in range(1, len(silences_ms)):
+            a_prev, b_prev = silences_ms[i-1]
+            a_i, b_i = silences_ms[i]
+            
+            pieces.append({
+                "piece_index": i + 1,
+                "start_ms": a_prev,
+                "end_ms": b_i,
+                "start_formatted": self._ms_to_timestamp(a_prev),
+                "end_formatted": self._ms_to_timestamp(b_i),
+                "duration_ms": b_i - a_prev,
+                "duration_minutes": round((b_i - a_prev) / 60000, 2),
+                "trim_leading_ms": max(0, b_prev - a_prev)
+            })
+        
+        # P(n+1) = [a_n, total_ms] (son sessizliğin başından dosya sonuna)
+        a_last, b_last = silences_ms[-1]
+        pieces.append({
+            "piece_index": len(silences_ms) + 1,
+            "start_ms": a_last,
+            "end_ms": total_ms,
+            "start_formatted": self._ms_to_timestamp(a_last),
+            "end_formatted": self._ms_to_timestamp(total_ms),
+            "duration_ms": total_ms - a_last,
+            "duration_minutes": round((total_ms - a_last) / 60000, 2),
+            "trim_leading_ms": max(0, b_last - a_last)
+        })
+        
+        return pieces
+    
+    def _create_parts_json(self, split_plan, special_folder_code):
+        """
+        parts.json dosyasını oluşturur
+        
+        Args:
+            split_plan (dict): Parçalama planı
+            special_folder_code (str): Klasör kodu
+        """
+        try:
+            parts_json_path = os.path.join(self.volume_path, "uploads", special_folder_code, "parts.json")
+            
+            parts_data = {
+                "split_plan": split_plan,
+                "total_pieces": len(split_plan["pieces"]),
+                "strategy": split_plan.get("strategy", "intelligent_splitting"),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                "analysis_version": "1.0"
+            }
+            
+            with open(parts_json_path, 'w', encoding='utf-8') as f:
+                json.dump(parts_data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"✅ parts.json oluşturuldu: {len(split_plan['pieces'])} parça planı")
+            return parts_data
+            
+        except Exception as e:
+            logger.error(f"❌ parts.json oluşturma hatası: {str(e)}")
+            raise
+    
+    def _ms_to_timestamp(self, ms):
+        """Milisaniyeyi HH:MM:SS.mmm formatına çevirir"""
+        seconds = ms / 1000
+        return self._seconds_to_timestamp(seconds)
+    
     def _seconds_to_timestamp(self, seconds):
         """Saniyeyi HH:MM:SS.mmm formatına çevirir"""
         hours = int(seconds // 3600)
@@ -414,7 +660,17 @@ class SilenceProcessor:
             # 8. Hızlı sessizlik analizi yap
             silence_analysis = self._detect_silence_segments_fast(audio_file_path)
             
-            # 9. Sonucu döndür
+            # 9. silence.json oluştur
+            silence_json_data = self._create_silence_json(silence_analysis["silences"], special_folder_code)
+            
+            # 10. Akıllı parçalama planı oluştur ve parts.json kaydet
+            split_plan = self._calculate_intelligent_split_plan(
+                audio_info["duration_minutes"], 
+                silence_analysis["silences"],
+                special_folder_code
+            )
+            
+            # 11. Sonucu döndür
             result = {
                 "success": True,
                 "special_folder_code": special_folder_code,
@@ -425,7 +681,10 @@ class SilenceProcessor:
                 "meta_info": meta_info,
                 "audio_info": audio_info,
                 "silence_analysis": silence_analysis,
-                "message": f"Ses dosyası, meta bilgileri ve sessizlik analizi tamamlandı: {islenmemis_filename}"
+                "silence_json_created": True,
+                "split_plan": split_plan,
+                "parts_json_created": True,
+                "message": f"Ses dosyası, meta bilgileri, sessizlik analizi, JSON dosyaları ve Silence7 parçalama planı tamamlandı: {islenmemis_filename}"
             }
             
             logger.info(f"✅ İşlem tamamlandı: {islenmemis_filename} - {audio_info['duration_seconds']}s")
@@ -494,6 +753,7 @@ def handler(job):
                     "silences": result["silence_analysis"]["silences"],
                     "params": result["silence_analysis"]["params"]
                 },
+                "split_plan": result["split_plan"],
                 "message": result["message"]
             }
         else:
