@@ -22,6 +22,38 @@ class SilenceProcessor:
         self.volume_path = "/runpod-volume"
         logger.info(f"✅ SilenceProcessor başlatıldı - Volume path: {self.volume_path}")
     
+    def _validate_input(self, special_folder_code):
+        """
+        Input parametresini doğrular
+        
+        Args:
+            special_folder_code (str): Klasör kodu
+            
+        Returns:
+            dict: Validation sonuçları
+        """
+        try:
+            if not special_folder_code:
+                raise ValueError("SpecialFolderCode boş olamaz")
+            
+            if not isinstance(special_folder_code, str):
+                raise ValueError("SpecialFolderCode string olmalı")
+            
+            if len(special_folder_code) < 3:
+                raise ValueError("SpecialFolderCode en az 3 karakter olmalı")
+            
+            # Klasörün varlığını kontrol et
+            folder_path = os.path.join(self.volume_path, "uploads", special_folder_code)
+            if not os.path.exists(folder_path):
+                raise ValueError(f"Klasör bulunamadı: {folder_path}")
+            
+            logger.info(f"✅ Input validation başarılı: {special_folder_code}")
+            return {"valid": True, "folder_path": folder_path}
+            
+        except Exception as e:
+            logger.error(f"❌ Input validation hatası: {str(e)}")
+            return {"valid": False, "error": str(e)}
+    
     def _read_json_from_volume(self, file_path):
         """
         Network volume'dan JSON dosyasını okur
@@ -218,6 +250,82 @@ class SilenceProcessor:
             logger.error(f"❌ Sessizlik analizi hatası: {str(e)}")
             raise
     
+    def _extract_and_save_metadata(self, audio_file_path, special_folder_code):
+        """
+        Ses dosyasının meta bilgilerini çıkarır ve meta.json olarak kaydeder
+        
+        Args:
+            audio_file_path (str): Ses dosyası yolu
+            special_folder_code (str): Klasör kodu
+            
+        Returns:
+            dict: Meta bilgileri
+        """
+        try:
+            full_path = os.path.join(self.volume_path, audio_file_path)
+            logger.info(f"📊 Meta bilgileri çıkarılıyor: {full_path}")
+            
+            if not os.path.exists(full_path):
+                raise FileNotFoundError(f"Ses dosyası bulunamadı: {full_path}")
+            
+            # WAV dosyası bilgilerini oku
+            with wave.open(full_path, 'r') as audio_file:
+                frame_rate = audio_file.getframerate()
+                n_frames = audio_file.getnframes()
+                channels = audio_file.getnchannels()
+                sample_width = audio_file.getsampwidth()
+                duration_seconds = n_frames / float(frame_rate)
+                
+            # Dosya bilgileri
+            file_size = os.path.getsize(full_path)
+            file_name = os.path.basename(full_path)
+            file_ext = os.path.splitext(file_name)[1].lower()
+            
+            # Meta bilgileri hazırla
+            metadata = {
+                "filename": file_name,
+                "file_path": audio_file_path,
+                "file_extension": file_ext,
+                "file_size_bytes": file_size,
+                "file_size_mb": round(file_size / (1024 * 1024), 2),
+                "duration_seconds": round(duration_seconds, 2),
+                "duration_minutes": round(duration_seconds / 60, 2),
+                "duration_formatted": self._seconds_to_timestamp(duration_seconds),
+                "sample_rate_hz": frame_rate,
+                "channels": channels,
+                "channel_type": "mono" if channels == 1 else "stereo" if channels == 2 else f"{channels}-channel",
+                "sample_width_bytes": sample_width,
+                "sample_width_bits": sample_width * 8,
+                "total_frames": n_frames,
+                "bitrate_kbps": round((file_size * 8) / (duration_seconds * 1000), 2) if duration_seconds > 0 else 0,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                "analysis_version": "1.0"
+            }
+            
+            # meta.json dosyasını kaydet
+            meta_json_path = os.path.join(self.volume_path, "uploads", special_folder_code, "meta.json")
+            
+            with open(meta_json_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"✅ Meta bilgileri kaydedildi: meta.json")
+            logger.info(f"📄 Dosya: {file_name} ({metadata['file_size_mb']} MB)")
+            logger.info(f"⏱️  Süre: {metadata['duration_formatted']} ({metadata['duration_seconds']}s)")
+            logger.info(f"🎵 Format: {metadata['sample_rate_hz']}Hz, {metadata['channel_type']}, {metadata['sample_width_bits']}-bit")
+            
+            return metadata
+            
+        except Exception as e:
+            logger.error(f"❌ Meta bilgi çıkarma hatası: {str(e)}")
+            raise
+    
+    def _seconds_to_timestamp(self, seconds):
+        """Saniyeyi HH:MM:SS.mmm formatına çevirir"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+    
     def _get_audio_duration(self, file_path):
         """
         Ses dosyasının süresini saniye cinsinden döndürür
@@ -276,39 +384,48 @@ class SilenceProcessor:
         try:
             logger.info(f"🚀 İşlem başlatılıyor: {special_folder_code}")
             
-            # 1. talimatname.json dosyasının yolunu oluştur
-            talimat_path = f"uploads/{special_folder_code}/talimatname.json"
+            # 1. Input validation
+            validation_result = self._validate_input(special_folder_code)
+            if not validation_result["valid"]:
+                raise ValueError(validation_result["error"])
             
-            # 2. JSON dosyasını oku
-            talimat_data = self._read_json_from_volume(talimat_path)
+            # 2. run.json dosyasının yolunu oluştur
+            run_json_path = f"uploads/{special_folder_code}/run.json"
             
-            # 3. IslenmemisFileName değerini al
-            if 'IslenmemisFileName' not in talimat_data:
-                raise ValueError("talimatname.json'da 'IslenmemisFileName' anahtarı bulunamadı")
+            # 3. run.json dosyasını oku
+            run_data = self._read_json_from_volume(run_json_path)
             
-            islenmemis_filename = talimat_data['IslenmemisFileName']
+            # 4. IslenmemisFileName değerini al
+            if 'IslenmemisFileName' not in run_data:
+                raise ValueError("run.json'da 'IslenmemisFileName' anahtarı bulunamadı")
+            
+            islenmemis_filename = run_data['IslenmemisFileName']
             logger.info(f"📂 Analiz edilecek dosya: {islenmemis_filename}")
             
-            # 4. Asıl dosyanın yolunu oluştur
+            # 5. Ses dosyasının yolunu oluştur
             audio_file_path = f"uploads/{special_folder_code}/{islenmemis_filename}"
             
-            # 5. Ses dosyasını analiz et
+            # 6. Meta bilgileri çıkar ve kaydet
+            meta_info = self._extract_and_save_metadata(audio_file_path, special_folder_code)
+            
+            # 7. Ses dosyasını analiz et
             audio_info = self._get_audio_duration(audio_file_path)
             
-            # 6. Hızlı sessizlik analizi yap
+            # 8. Hızlı sessizlik analizi yap
             silence_analysis = self._detect_silence_segments_fast(audio_file_path)
             
-            # 7. Sonucu döndür
+            # 9. Sonucu döndür
             result = {
                 "success": True,
                 "special_folder_code": special_folder_code,
                 "filename": islenmemis_filename,
                 "file_path": audio_file_path,
                 "volume_path": f"{self.volume_path}/{audio_file_path}",
-                "talimat_data": talimat_data,
+                "run_data": run_data,
+                "meta_info": meta_info,
                 "audio_info": audio_info,
                 "silence_analysis": silence_analysis,
-                "message": f"Ses dosyası ve sessizlik analizi tamamlandı: {islenmemis_filename}"
+                "message": f"Ses dosyası, meta bilgileri ve sessizlik analizi tamamlandı: {islenmemis_filename}"
             }
             
             logger.info(f"✅ İşlem tamamlandı: {islenmemis_filename} - {audio_info['duration_seconds']}s")
