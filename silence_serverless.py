@@ -4,7 +4,8 @@ import os
 import wave
 import logging
 import numpy as np
-import struct
+import math
+import time
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -48,17 +49,18 @@ class SilenceProcessor:
             logger.error(f"❌ JSON okuma hatası: {str(e)}")
             raise
     
-    def _detect_silence_segments(self, file_path, silence_threshold=0.01, min_silence_duration=0.5):
+    def _detect_silence_segments_fast(self, file_path, min_silence_len_ms=500, silence_thresh_db=None, seek_step_ms=20):
         """
-        Ses dosyasındaki sessizlik bölümlerini tespit eder
+        Hızlı sessizlik tespiti (silence7.py algoritması bazında)
         
         Args:
             file_path (str): Volume'daki ses dosyası yolu
-            silence_threshold (float): Sessizlik eşiği (0-1 arası, varsayılan: 0.01)
-            min_silence_duration (float): Minimum sessizlik süresi (saniye, varsayılan: 0.5)
+            min_silence_len_ms (int): Minimum sessizlik süresi (ms, varsayılan: 500)
+            silence_thresh_db (float): Sessizlik eşiği dBFS (None=otomatik)
+            seek_step_ms (int): Analiz adımı (ms, varsayılan: 20)
             
         Returns:
-            dict: Sessizlik analizi sonuçları
+            dict: Hızlı sessizlik analizi sonuçları
         """
         try:
             full_path = os.path.join(self.volume_path, file_path)
@@ -67,118 +69,148 @@ class SilenceProcessor:
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"Ses dosyası bulunamadı: {full_path}")
             
-            silence_segments = []
+            t_detect_start = time.perf_counter()
             
-            with wave.open(full_path, 'r') as audio_file:
-                frame_rate = audio_file.getframerate()
-                n_frames = audio_file.getnframes()
-                duration = n_frames / float(frame_rate)
-                channels = audio_file.getnchannels()
-                sample_width = audio_file.getsampwidth()
-                
-                # Ses verisini oku
-                raw_audio = audio_file.readframes(n_frames)
-                
-            # Raw audio verisini numpy array'e dönüştür
-            if sample_width == 1:
-                # 8-bit unsigned
-                audio_data = np.frombuffer(raw_audio, dtype=np.uint8).astype(np.float32)
-                audio_data = (audio_data - 128) / 128.0  # -1 ile 1 arasına normalize et
-            elif sample_width == 2:
-                # 16-bit signed
-                audio_data = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
-                audio_data = audio_data / 32768.0  # -1 ile 1 arasına normalize et
-            elif sample_width == 3:
-                # 24-bit signed (daha kompleks)
-                audio_bytes = np.frombuffer(raw_audio, dtype=np.uint8)
-                # 24-bit'i 32-bit'e dönüştür
-                audio_24bit = []
-                for i in range(0, len(audio_bytes), 3):
-                    if i + 2 < len(audio_bytes):
-                        # Little-endian 24-bit'i oku
-                        sample = audio_bytes[i] | (audio_bytes[i+1] << 8) | (audio_bytes[i+2] << 16)
-                        # Sign extension
-                        if sample & 0x800000:
-                            sample |= 0xFF000000
-                        audio_24bit.append(sample)
-                audio_data = np.array(audio_24bit, dtype=np.float32) / (2**23)
-            elif sample_width == 4:
-                # 32-bit signed
-                audio_data = np.frombuffer(raw_audio, dtype=np.int32).astype(np.float32)
-                audio_data = audio_data / (2**31)
+            # WAV dosyasını oku (silence7.py formatında)
+            with wave.open(full_path, 'r') as wf:
+                n_frames = wf.getnframes()
+                sr = wf.getframerate() 
+                ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                raw = wf.readframes(n_frames)
+            
+            # Audio verisini float32'ye dönüştür (silence7.py algoritması)
+            if sw == 1:
+                data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = (data - 128.0) / 128.0
+            elif sw == 2:
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = data / 32768.0
+            elif sw == 4:
+                data = np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = data / 2147483648.0
             else:
-                raise ValueError(f"Desteklenmeyen sample width: {sample_width}")
+                raise ValueError(f"Desteklenmeyen sample width: {sw} bayt")
             
-            # Multi-channel ise ortalama al
-            if channels > 1:
-                audio_data = audio_data.reshape(-1, channels)
-                audio_data = np.mean(audio_data, axis=1)
+            total_ms = int(round(len(data) / sr * 1000.0))
             
-            # Mutlak değer al (amplitüd)
-            audio_amplitude = np.abs(audio_data)
+            # Mono ses için ortalama al
+            x_mono = data.mean(axis=1).astype(np.float32)
             
-            # Sessizlik tespiti
-            min_silence_samples = int(min_silence_duration * frame_rate)
-            silence_mask = audio_amplitude < silence_threshold
+            # Otomatik eşik hesaplama (silence7.py'den)
+            def audio_dbfs(x):
+                if x.size == 0: return float("-inf")
+                rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+                if rms <= 0.0 or not math.isfinite(rms): return float("-inf")
+                return 20.0 * math.log10(rms)
             
-            # Ardışık sessizlik bölümlerini bul
-            in_silence = False
-            silence_start = 0
-            total_silence_duration = 0
+            audio_db = audio_dbfs(x_mono)
+            if silence_thresh_db is None:
+                silence_thresh_db = (-40.0 if not math.isfinite(audio_db) else (audio_db - 16.0))
             
-            for i in range(len(silence_mask)):
-                if silence_mask[i] and not in_silence:
-                    # Sessizlik başlıyor
-                    silence_start = i
-                    in_silence = True
-                elif not silence_mask[i] and in_silence:
-                    # Sessizlik bitiyor
-                    silence_length = i - silence_start
-                    if silence_length >= min_silence_samples:
-                        start_time = silence_start / frame_rate
-                        end_time = i / frame_rate
-                        duration = end_time - start_time
-                        
-                        silence_segments.append({
-                            "start_time": round(start_time, 3),
-                            "end_time": round(end_time, 3),
-                            "duration": round(duration, 3)
-                        })
-                        total_silence_duration += duration
-                    
-                    in_silence = False
+            # Hızlı sessizlik tespiti (chunked RMS)
+            def detect_silence_chunked(x_mono, sr, min_silence_len_ms, silence_thresh_db, seek_step_ms):
+                if len(x_mono) == 0: return []
+                
+                hop = max(1, int(round(sr * (seek_step_ms / 1000.0))))
+                win = hop
+                
+                n_hops = int(np.ceil((len(x_mono) - win) / hop)) + 1
+                pad_len = (n_hops - 1) * hop + win - len(x_mono)
+                if pad_len > 0:
+                    x_pad = np.pad(x_mono, (0, pad_len), mode="constant")
+                else:
+                    x_pad = x_mono
+                
+                silent = []
+                for i in range(n_hops):
+                    start = i * hop
+                    seg = x_pad[start:start + win]
+                    rms = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
+                    seg_db = float("-inf") if rms <= 0.0 else 20.0 * math.log10(rms)
+                    silent.append(seg_db < silence_thresh_db)
+                
+                segments = []
+                i = 0
+                while i < n_hops:
+                    if silent[i]:
+                        s = i
+                        while i < n_hops and silent[i]: i += 1
+                        e = i
+                        if (e - s) * seek_step_ms >= min_silence_len_ms:
+                            segments.append([s * seek_step_ms, e * seek_step_ms])
+                    else:
+                        i += 1
+                
+                def clamp(v, lo, hi): return max(lo, min(hi, v))
+                audio_ms = int(round(len(x_mono) / sr * 1000.0))
+                return [[clamp(s, 0, audio_ms), clamp(e, 0, audio_ms)] for s, e in segments]
             
-            # Son segment kontrol et
-            if in_silence:
-                silence_length = len(silence_mask) - silence_start
-                if silence_length >= min_silence_samples:
-                    start_time = silence_start / frame_rate
-                    end_time = duration
-                    segment_duration = end_time - start_time
-                    
-                    silence_segments.append({
-                        "start_time": round(start_time, 3),
-                        "end_time": round(end_time, 3),
-                        "duration": round(segment_duration, 3)
-                    })
-                    total_silence_duration += segment_duration
+            spans = detect_silence_chunked(x_mono, sr, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+            
+            # Timestamp dönüştürme fonksiyonu
+            def ms_to_timestamp(ms):
+                ms = int(ms); s, ms = divmod(ms, 1000); m, s = divmod(s, 60); h, m = divmod(m, 60)
+                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+            
+            # Silence7.py formatında çıktı hazırla
+            silences = []
+            total_silence_ms = 0
+            
+            for i, (s, e) in enumerate(spans, 1):
+                duration_ms = e - s
+                total_silence_ms += duration_ms
+                silences.append({
+                    "index": i,
+                    "start_ms": s,
+                    "end_ms": e,
+                    "start": ms_to_timestamp(s),
+                    "end": ms_to_timestamp(e),
+                    "duration_ms": duration_ms,
+                    "duration": ms_to_timestamp(duration_ms)
+                })
             
             # İstatistikler
-            silence_percentage = (total_silence_duration / duration) * 100 if duration > 0 else 0
-            speech_duration = duration - total_silence_duration
+            speech_ms = total_ms - total_silence_ms
+            silence_percentage = (total_silence_ms / total_ms) * 100 if total_ms > 0 else 0
+            speech_percentage = 100 - silence_percentage
             
-            logger.info(f"🔍 Sessizlik analizi tamamlandı: {len(silence_segments)} segment, %{silence_percentage:.1f} sessizlik")
+            t_detect_end = time.perf_counter()
+            detect_time = t_detect_end - t_detect_start
+            
+            logger.info(f"🔍 Hızlı sessizlik analizi: {len(silences)} segment, %{silence_percentage:.1f} sessizlik, {detect_time:.3f}s")
             
             return {
-                "silence_segments": silence_segments,
-                "total_silence_duration": round(total_silence_duration, 2),
-                "speech_duration": round(speech_duration, 2),
+                "silences": silences,
+                "audio_duration_ms": total_ms,
+                "audio_duration": ms_to_timestamp(total_ms),
+                "total_silence_ms": total_silence_ms,
+                "speech_ms": speech_ms,
                 "silence_percentage": round(silence_percentage, 1),
-                "speech_percentage": round(100 - silence_percentage, 1),
-                "segment_count": len(silence_segments),
-                "settings": {
-                    "silence_threshold": silence_threshold,
-                    "min_silence_duration": min_silence_duration
+                "speech_percentage": round(speech_percentage, 1),
+                "segment_count": len(silences),
+                "detection_time_seconds": round(detect_time, 3),
+                "params": {
+                    "min_silence_len_ms": min_silence_len_ms,
+                    "silence_thresh_dbfs": round(silence_thresh_db, 1),
+                    "seek_step_ms": seek_step_ms,
+                    "sr_hz": sr,
+                    "channels": ch
                 }
             }
             
@@ -263,8 +295,8 @@ class SilenceProcessor:
             # 5. Ses dosyasını analiz et
             audio_info = self._get_audio_duration(audio_file_path)
             
-            # 6. Sessizlik analizi yap
-            silence_analysis = self._detect_silence_segments(audio_file_path)
+            # 6. Hızlı sessizlik analizi yap
+            silence_analysis = self._detect_silence_segments_fast(audio_file_path)
             
             # 7. Sonucu döndür
             result = {
@@ -334,12 +366,16 @@ def handler(job):
                     "file_size_mb": result["audio_info"]["file_size_mb"]
                 },
                 "silence_analysis": {
-                    "total_silence_duration": result["silence_analysis"]["total_silence_duration"],
-                    "speech_duration": result["silence_analysis"]["speech_duration"],
+                    "audio_duration_ms": result["silence_analysis"]["audio_duration_ms"],
+                    "audio_duration": result["silence_analysis"]["audio_duration"],
+                    "total_silence_ms": result["silence_analysis"]["total_silence_ms"],
+                    "speech_ms": result["silence_analysis"]["speech_ms"],
                     "silence_percentage": result["silence_analysis"]["silence_percentage"],
                     "speech_percentage": result["silence_analysis"]["speech_percentage"],
                     "segment_count": result["silence_analysis"]["segment_count"],
-                    "silence_segments": result["silence_analysis"]["silence_segments"]
+                    "detection_time_seconds": result["silence_analysis"]["detection_time_seconds"],
+                    "silences": result["silence_analysis"]["silences"],
+                    "params": result["silence_analysis"]["params"]
                 },
                 "message": result["message"]
             }
