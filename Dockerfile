@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Handler kodunu kopyala
-COPY silence_serverless.py .
+COPY silence_serverless_r2.py .
 
 # Container başlatıldığında çalışacak komut
-CMD ["python", "-u", "silence_serverless.py"]
+CMD ["python", "-u", "silence_serverless_r2.py"]
