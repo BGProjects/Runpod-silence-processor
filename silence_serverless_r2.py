@@ -10,6 +10,9 @@ import boto3
 import tempfile
 import shutil
 from botocore.exceptions import ClientError
+import multiprocessing
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -404,6 +407,347 @@ class SilenceProcessorR2:
             logger.error(f"❌ Sessizlik analizi hatası: {str(e)}")
             raise
     
+    def _detect_silence_segments_multiprocessing(self, file_path, min_silence_len_ms=500, silence_thresh_db=None, seek_step_ms=20, use_multiprocessing=True):
+        """
+        Multiprocessing version of silence detection for improved performance on multi-core systems
+        
+        Args:
+            file_path (str): Yerel ses dosyası yolu
+            min_silence_len_ms (int): Minimum sessizlik süresi (ms)
+            silence_thresh_db (float): Sessizlik eşiği dBFS
+            seek_step_ms (int): Analiz adımı (ms)
+            use_multiprocessing (bool): Use multiprocessing if True, fallback to single-threaded if False
+            
+        Returns:
+            dict: Sessizlik analizi sonuçları (same format as _detect_silence_segments_fast)
+        """
+        try:
+            logger.info(f"🔍 Multiprocessing sessizlik analizi başlıyor: {file_path}")
+            
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Ses dosyası bulunamadı: {file_path}")
+            
+            # Determine number of processes to use
+            num_processes = min(cpu_count(), 8) if use_multiprocessing else 1  # Cap at 8 processes
+            
+            # Read file size to determine if multiprocessing is worthwhile
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            
+            # If single processing requested, only 1 CPU, or small file, fallback to original method
+            if not use_multiprocessing or num_processes <= 1 or file_size_mb < 5.0:
+                if file_size_mb < 5.0:
+                    logger.info(f"🔄 Small file ({file_size_mb:.1f}MB), using single-threaded processing")
+                else:
+                    logger.info("🔄 Falling back to single-threaded processing")
+                return self._detect_silence_segments_fast(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+            
+            t_detect_start = time.perf_counter()
+            
+            # Read audio file (same as original)
+            with wave.open(file_path, 'r') as wf:
+                n_frames = wf.getnframes()
+                sr = wf.getframerate() 
+                ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                raw = wf.readframes(n_frames)
+            
+            # Convert audio data to float32 (same as original)
+            if sw == 1:
+                data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = (data - 128.0) / 128.0
+            elif sw == 2:
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = data / 32768.0
+            elif sw == 4:
+                data = np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                if ch > 1:
+                    n = (len(data) // ch) * ch
+                    data = data[:n].reshape(-1, ch)
+                else:
+                    data = data.reshape(-1, 1)
+                data = data / 2147483648.0
+            else:
+                raise ValueError(f"Desteklenmeyen sample width: {sw} bayt")
+            
+            total_ms = int(round(len(data) / sr * 1000.0))
+            x_mono = data.mean(axis=1).astype(np.float32)
+            
+            # Calculate automatic threshold (same as original)
+            def audio_dbfs(x):
+                if x.size == 0: return float("-inf")
+                rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+                if rms <= 0.0 or not math.isfinite(rms): return float("-inf")
+                return 20.0 * math.log10(rms)
+            
+            audio_db = audio_dbfs(x_mono)
+            if silence_thresh_db is None:
+                silence_thresh_db = (-40.0 if not math.isfinite(audio_db) else (audio_db - 16.0))
+            
+            # Calculate hop and window size
+            hop = max(1, int(round(sr * (seek_step_ms / 1000.0))))
+            win = hop
+            
+            if len(x_mono) == 0:
+                spans = []
+            else:
+                # Calculate total number of hops needed (same as original)
+                n_hops = int(np.ceil((len(x_mono) - win) / hop)) + 1
+                pad_len = (n_hops - 1) * hop + win - len(x_mono)
+                if pad_len > 0:
+                    x_pad = np.pad(x_mono, (0, pad_len), mode="constant")
+                else:
+                    x_pad = x_mono
+                
+                # Split hops among processes
+                hops_per_process = max(n_hops // num_processes, 10)  # Ensure minimum work per process
+                chunks = []
+                
+                for i in range(num_processes):
+                    start_hop = i * hops_per_process
+                    if i == num_processes - 1:  # Last chunk gets remaining hops
+                        end_hop = n_hops
+                    else:
+                        end_hop = min((i + 1) * hops_per_process, n_hops)
+                    
+                    if start_hop < n_hops:
+                        # Calculate sample indices for this hop range
+                        start_sample = start_hop * hop
+                        end_sample = min(end_hop * hop + win, len(x_pad))
+                        
+                        chunk_data = {
+                            'x_chunk': x_pad[start_sample:end_sample],
+                            'start_hop_idx': start_hop,
+                            'hop': hop,
+                            'win': win,
+                            'silence_thresh_db': silence_thresh_db,
+                            'chunk_idx': i
+                        }
+                        chunks.append(chunk_data)
+                
+                logger.info(f"🚀 Processing {n_hops} hops across {len(chunks)} chunks with {num_processes} processes")
+                
+                # Process chunks in parallel
+                with Pool(processes=num_processes) as pool:
+                    try:
+                        chunk_results = pool.map(SilenceProcessorR2._process_audio_chunk, chunks)
+                    except Exception as e:
+                        logger.error(f"❌ Multiprocessing error: {e}, falling back to single-threaded")
+                        return self._detect_silence_segments_fast(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+                
+                # Reconstruct the complete silent array from chunks
+                silent = [False] * n_hops
+                for chunk_result in chunk_results:
+                    if chunk_result['silent']:
+                        start_idx = chunk_result['start_hop_idx']
+                        for j, is_silent in enumerate(chunk_result['silent']):
+                            if start_idx + j < len(silent):
+                                silent[start_idx + j] = is_silent
+                
+                # Now apply the exact same segment detection logic as original
+                segments = []
+                i = 0
+                while i < n_hops:
+                    if silent[i]:
+                        s = i
+                        while i < n_hops and silent[i]: 
+                            i += 1
+                        e = i
+                        if (e - s) * seek_step_ms >= min_silence_len_ms:
+                            segments.append([s * seek_step_ms, e * seek_step_ms])
+                    else:
+                        i += 1
+                
+                # Clamp segments to audio boundaries (same as original)
+                def clamp(v, lo, hi): return max(lo, min(hi, v))
+                audio_ms = int(round(len(x_mono) / sr * 1000.0))
+                spans = [[clamp(s, 0, audio_ms), clamp(e, 0, audio_ms)] for s, e in segments]
+            
+            # Format results (same as original)
+            def ms_to_timestamp(ms):
+                ms = int(ms); s, ms = divmod(ms, 1000); m, s = divmod(s, 60); h, m = divmod(m, 60)
+                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+            
+            silences = []
+            total_silence_ms = 0
+            
+            for i, (s, e) in enumerate(spans, 1):
+                duration_ms = e - s
+                total_silence_ms += duration_ms
+                silences.append({
+                    "index": i,
+                    "start_ms": s,
+                    "end_ms": e,
+                    "start": ms_to_timestamp(s),
+                    "end": ms_to_timestamp(e),
+                    "duration_ms": duration_ms,
+                    "duration": ms_to_timestamp(duration_ms)
+                })
+            
+            # Calculate statistics
+            speech_ms = total_ms - total_silence_ms
+            silence_percentage = (total_silence_ms / total_ms) * 100 if total_ms > 0 else 0
+            speech_percentage = 100 - silence_percentage
+            
+            t_detect_end = time.perf_counter()
+            detect_time = t_detect_end - t_detect_start
+            
+            logger.info(f"🚀 Multiprocessing analizi: {len(silences)} segment, %{silence_percentage:.1f} sessizlik, {detect_time:.3f}s ({num_processes} processes)")
+            
+            return {
+                "silences": silences,
+                "audio_duration_ms": total_ms,
+                "audio_duration": ms_to_timestamp(total_ms),
+                "total_silence_ms": total_silence_ms,
+                "speech_ms": speech_ms,
+                "silence_percentage": round(silence_percentage, 1),
+                "speech_percentage": round(speech_percentage, 1),
+                "segment_count": len(silences),
+                "detection_time_seconds": round(detect_time, 3),
+                "processing_method": f"multiprocessing_{num_processes}_cores",
+                "params": {
+                    "min_silence_len_ms": min_silence_len_ms,
+                    "silence_thresh_dbfs": round(silence_thresh_db, 1),
+                    "seek_step_ms": seek_step_ms,
+                    "sr_hz": sr,
+                    "channels": ch,
+                    "num_processes": num_processes
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Multiprocessing sessizlik analizi hatası: {str(e)}, falling back to single-threaded")
+            # Fallback to original method on any error
+            return self._detect_silence_segments_fast(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+    
+    def _benchmark_silence_detection(self, file_path, min_silence_len_ms=500, silence_thresh_db=None, seek_step_ms=20):
+        """
+        Benchmarks both single-threaded and multiprocessing silence detection methods
+        
+        Args:
+            file_path (str): Yerel ses dosyası yolu
+            min_silence_len_ms (int): Minimum sessizlik süresi (ms)
+            silence_thresh_db (float): Sessizlik eşiği dBFS
+            seek_step_ms (int): Analiz adımı (ms)
+            
+        Returns:
+            dict: Benchmark results comparing both methods
+        """
+        try:
+            logger.info(f"🏁 Benchmark başlıyor: {file_path}")
+            
+            # Run single-threaded version
+            logger.info("📊 Single-threaded benchmark...")
+            single_start = time.perf_counter()
+            single_result = self._detect_silence_segments_fast(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+            single_time = time.perf_counter() - single_start
+            
+            # Run multiprocessing version  
+            logger.info("🚀 Multiprocessing benchmark...")
+            multi_start = time.perf_counter()
+            multi_result = self._detect_silence_segments_multiprocessing(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms, use_multiprocessing=True)
+            multi_time = time.perf_counter() - multi_start
+            
+            # Calculate speedup
+            speedup = single_time / multi_time if multi_time > 0 else 0
+            cpu_cores = cpu_count()
+            
+            # Compare results to ensure they're identical
+            single_segments = len(single_result.get('silences', []))
+            multi_segments = len(multi_result.get('silences', []))
+            results_match = single_segments == multi_segments
+            
+            benchmark_results = {
+                "file_path": file_path,
+                "cpu_cores_available": cpu_cores,
+                "single_threaded": {
+                    "time_seconds": round(single_time, 3),
+                    "segments_found": single_segments,
+                    "method": "single_threaded"
+                },
+                "multiprocessing": {
+                    "time_seconds": round(multi_time, 3),
+                    "segments_found": multi_segments,
+                    "method": multi_result.get('params', {}).get('processing_method', 'multiprocessing'),
+                    "processes_used": multi_result.get('params', {}).get('num_processes', 1)
+                },
+                "performance": {
+                    "speedup_factor": round(speedup, 2),
+                    "time_saved_seconds": round(single_time - multi_time, 3),
+                    "time_saved_percentage": round((single_time - multi_time) / single_time * 100, 1) if single_time > 0 else 0,
+                    "results_identical": results_match
+                },
+                "audio_info": {
+                    "duration_ms": single_result.get('audio_duration_ms', 0),
+                    "sample_rate": single_result.get('params', {}).get('sr_hz', 0)
+                }
+            }
+            
+            # Log benchmark results
+            logger.info(f"🏆 Benchmark tamamlandı:")
+            logger.info(f"   📈 Single-threaded: {single_time:.3f}s ({single_segments} segments)")
+            logger.info(f"   🚀 Multiprocessing: {multi_time:.3f}s ({multi_segments} segments)")
+            logger.info(f"   ⚡ Speedup: {speedup:.2f}x ({benchmark_results['performance']['time_saved_percentage']:.1f}% faster)")
+            logger.info(f"   ✅ Results match: {results_match}")
+            
+            return benchmark_results
+            
+        except Exception as e:
+            logger.error(f"❌ Benchmark hatası: {str(e)}")
+            return {"error": str(e)}
+    
+    def detect_silence_segments(self, file_path, min_silence_len_ms=500, silence_thresh_db=None, seek_step_ms=20, use_multiprocessing=None, run_benchmark=False):
+        """
+        Main silence detection method with configurable processing mode
+        
+        Args:
+            file_path (str): Yerel ses dosyası yolu
+            min_silence_len_ms (int): Minimum sessizlik süresi (ms)
+            silence_thresh_db (float): Sessizlik eşiği dBFS
+            seek_step_ms (int): Analiz adımı (ms)
+            use_multiprocessing (bool): None=auto-detect, True=force multiprocessing, False=force single-threaded
+            run_benchmark (bool): If True, run both methods and compare performance
+            
+        Returns:
+            dict: Sessizlik analizi sonuçları
+        """
+        try:
+            if run_benchmark:
+                return self._benchmark_silence_detection(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+            
+            # Auto-detect best method if not specified
+            if use_multiprocessing is None:
+                # Check file size and CPU count to decide
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                
+                # Use multiprocessing for systems with more than 2 cores AND larger files
+                use_multiprocessing = cpu_count() > 2 and file_size_mb >= 5.0
+                
+                if file_size_mb < 5.0:
+                    logger.info(f"🤖 Auto-detected: single-threaded (small file: {file_size_mb:.1f}MB)")
+                else:
+                    logger.info(f"🤖 Auto-detected: {'multiprocessing' if use_multiprocessing else 'single-threaded'} ({cpu_count()} cores, {file_size_mb:.1f}MB file)")
+            
+            if use_multiprocessing:
+                return self._detect_silence_segments_multiprocessing(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms, use_multiprocessing=True)
+            else:
+                result = self._detect_silence_segments_fast(file_path, min_silence_len_ms, silence_thresh_db, seek_step_ms)
+                result['processing_method'] = 'single_threaded'
+                return result
+                
+        except Exception as e:
+            logger.error(f"❌ Silence detection error: {str(e)}")
+            raise
+    
     def _create_silence_json(self, silence_segments, special_folder_code):
         """
         silence.json dosyasını oluşturur ve R2'ye yükler
@@ -442,6 +786,58 @@ class SilenceProcessorR2:
         minutes = int((seconds % 3600) // 60)
         secs = seconds % 60
         return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+    
+    @staticmethod
+    def _process_audio_chunk(chunk_data):
+        """
+        Worker function to process audio chunk for multiprocessing
+        Returns boolean array indicating silent segments
+        
+        Args:
+            chunk_data (dict): Dictionary containing chunk parameters
+                
+        Returns:
+            dict: Contains silent boolean array and metadata
+        """
+        try:
+            x_chunk = chunk_data['x_chunk']
+            start_hop_idx = chunk_data['start_hop_idx'] 
+            hop = chunk_data['hop']
+            win = chunk_data['win']
+            silence_thresh_db = chunk_data['silence_thresh_db']
+            chunk_idx = chunk_data['chunk_idx']
+            
+            # Calculate number of hops for this chunk
+            n_hops = int(np.ceil((len(x_chunk) - win) / hop)) + 1 if len(x_chunk) >= win else 0
+            
+            if n_hops <= 0:
+                return {'silent': [], 'start_hop_idx': start_hop_idx, 'chunk_idx': chunk_idx}
+            
+            # Pad chunk if necessary
+            pad_len = (n_hops - 1) * hop + win - len(x_chunk)
+            if pad_len > 0:
+                x_pad = np.pad(x_chunk, (0, pad_len), mode="constant")
+            else:
+                x_pad = x_chunk
+            
+            # Process each segment in this chunk (identical to original algorithm)
+            silent = []
+            for i in range(n_hops):
+                start = i * hop
+                seg = x_pad[start:start + win]
+                rms = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
+                seg_db = float("-inf") if rms <= 0.0 else 20.0 * math.log10(rms)
+                silent.append(seg_db < silence_thresh_db)
+            
+            return {
+                'silent': silent,
+                'start_hop_idx': start_hop_idx,
+                'chunk_idx': chunk_idx
+            }
+            
+        except Exception as e:
+            print(f"Error processing chunk {chunk_data.get('chunk_idx', '?')}: {e}")
+            return {'silent': [], 'start_hop_idx': chunk_data.get('start_hop_idx', 0), 'chunk_idx': chunk_data.get('chunk_idx', -1)}
     
     def _cleanup_temp_files(self):
         """Temp dosyalarını temizler"""
@@ -492,8 +888,8 @@ class SilenceProcessorR2:
             # 5. Meta bilgileri çıkar ve kaydet
             meta_info = self._extract_and_save_metadata(temp_audio_path, special_folder_code)
             
-            # 6. Hızlı sessizlik analizi yap
-            silence_analysis = self._detect_silence_segments_fast(temp_audio_path)
+            # 6. Multiprocessing sessizlik analizi yap (auto-detect best method)
+            silence_analysis = self.detect_silence_segments(temp_audio_path, use_multiprocessing=None)
             
             # 7. silence.json oluştur ve R2'ye kaydet
             silence_json_data = self._create_silence_json(silence_analysis["silences"], special_folder_code)
