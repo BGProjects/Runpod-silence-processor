@@ -538,7 +538,7 @@ def handler(job):
     Expected input format:
     {
         "input": {
-            "special_folder_code": "20250814021530AB12CD"
+            "SpecialFolderCode": "20250814021530AB12CD"
         }
     }
     """
@@ -546,10 +546,10 @@ def handler(job):
         job_input = job["input"]
         
         # Input validation
-        if not job_input.get("special_folder_code"):
-            return {"error": "special_folder_code parametresi gerekli"}
+        if not job_input.get("SpecialFolderCode"):
+            return {"error": "SpecialFolderCode parametresi gerekli"}
         
-        special_folder_code = job_input["special_folder_code"]
+        special_folder_code = job_input["SpecialFolderCode"]
         
         logger.info(f"🎯 R2 Handler başlatıldı: {special_folder_code}")
         
