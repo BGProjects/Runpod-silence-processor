@@ -888,8 +888,8 @@ class SilenceProcessorR2:
             # 5. Meta bilgileri çıkar ve kaydet
             meta_info = self._extract_and_save_metadata(temp_audio_path, special_folder_code)
             
-            # 6. Multiprocessing sessizlik analizi yap (auto-detect best method)
-            silence_analysis = self.detect_silence_segments(temp_audio_path, use_multiprocessing=None)
+            # 6. Single-threaded sessizlik analizi yap (multiprocessing kapalı)
+            silence_analysis = self.detect_silence_segments(temp_audio_path, use_multiprocessing=False)
             
             # 7. silence.json oluştur ve R2'ye kaydet
             silence_json_data = self._create_silence_json(silence_analysis["silences"], special_folder_code)
