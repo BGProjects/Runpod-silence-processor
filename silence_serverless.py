@@ -362,8 +362,8 @@ class SilenceProcessor:
         try:
             logger.info(f"🤖 Akıllı parçalama planı hesaplanıyor: {total_duration_minutes:.2f} dakika")
             
-            # Hedef parça süresi: 15 dakika
-            target_segment_minutes = 15
+            # Hedef parça süresi: 5 dakika (test için düşürüldü)
+            target_segment_minutes = 5
             
             # Parça sayısını hesapla
             if total_duration_minutes <= 20:
